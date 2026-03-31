@@ -35,7 +35,7 @@ WORKDIR /app
 COPY --from=builder /build/gemini-web2api .
 
 # 复制示例环境变量文件（实际 .env 通过挂载或 env_file 注入）
-COPY .env.example .env.example
+COPY .env.example* ./
 
 # 暴露默认端口（可通过环境变量 PORT 覆盖）
 EXPOSE 8007
