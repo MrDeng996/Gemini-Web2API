@@ -10,7 +10,7 @@ WORKDIR /build
 
 # 先复制 go.mod / go.sum，利用 Docker 层缓存加速依赖下载
 COPY go.mod go.sum ./
-RUN go mod download
+RUN go mod download && go mod tidy
 
 # 复制全部源码
 COPY . .
