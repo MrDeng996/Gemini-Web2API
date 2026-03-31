@@ -1,0 +1,25 @@
+# Binaries and executables
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Logs
+*.log
+
+# OS Specific
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Go
+go.work
+
+# env
+.env
+
+# Reference files
+reference*/

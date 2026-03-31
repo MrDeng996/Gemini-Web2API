@@ -1,0 +1,327 @@
+package gemini
+
+import (
+	"fmt"
+	"io"
+	"log"
+	"net/url"
+	"os"
+	"regexp"
+	"strings"
+
+	http "github.com/bogdanfinn/fhttp"
+	tls_client "github.com/bogdanfinn/tls-client"
+)
+
+const (
+	EndpointGoogle   = "https://www.google.com"
+	EndpointInit     = "https://gemini.google.com/app"
+	EndpointGenerate = "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
+)
+
+// ModelHeaders maps model names to their specific required headers.
+// You can add new models here by inspecting the 'x-goog-ext-525001261-jspb' header in browser DevTools.
+var ModelHeaders = map[string]string{
+	"gemini-2.5-flash":                   `[1,null,null,null,"71c2d248d3b102ff"]`,
+	"gemini-3.1-pro-preview":             `[1,null,null,null,"e6fa609c3fa255c0"]`,
+	"gemini-3-flash-preview":             `[1,null,null,null,"e051ce1aa80aa576"]`,
+	"gemini-3-flash-preview-no-thinking": `[1,null,null,null,"56fdd199312815e2"]`,
+	"gemini-2.5-flash-image":             `[1,null,null,null,"56fdd199312815e2",null,null,0,[4],null,null,2]`,
+	"gemini-3-pro-image-preview":         `[1,null,null,null,"e051ce1aa80aa576",null,null,0,[4],null,null,2]`,
+}
+
+type Client struct {
+	httpClient tls_client.HttpClient
+	Cookies    map[string]string
+	SNlM0e     string
+	VersionBL  string
+	FSID       string
+	ReqID      int
+	AccountID  string
+	ProxyURL   string
+}
+
+func NewClient(cookies map[string]string, proxyURL string) (*Client, error) {
+	profile := GetRandomProfile()
+
+	options := GetClientOptions(profile, proxyURL)
+	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+	if err != nil {
+		return nil, err
+	}
+
+	u, _ := url.Parse("https://gemini.google.com")
+	var cookieList []*http.Cookie
+	for k, v := range cookies {
+		cookieList = append(cookieList, &http.Cookie{
+			Name:   k,
+			Value:  v,
+			Domain: ".google.com",
+			Path:   "/",
+		})
+	}
+	client.SetCookies(u, cookieList)
+
+	return &Client{
+		httpClient: client,
+		Cookies:    cookies,
+		ReqID:      GenerateReqID(),
+		ProxyURL:   strings.TrimSpace(proxyURL),
+	}, nil
+}
+
+func (c *Client) Init() error {
+	req, _ := http.NewRequest(http.MethodGet, EndpointInit, nil)
+	req.Header.Set("User-Agent", GetCurrentUserAgent())
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", getLangHeader())
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-User", "?1")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("account '%s' failed to visit init page: %v", c.displayAccountID(), err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("account '%s' init page returned status: %d", c.displayAccountID(), resp.StatusCode)
+	}
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyString := string(bodyBytes)
+
+	reSN := regexp.MustCompile(`"SNlM0e":"(.*?)"`)
+	matchSN := reSN.FindStringSubmatch(bodyString)
+	if len(matchSN) < 2 {
+		return fmt.Errorf("account '%s' SNlM0e token not found. Cookies might be invalid", c.displayAccountID())
+	}
+	c.SNlM0e = matchSN[1]
+
+	reBL := regexp.MustCompile(`"bl":"(.*?)"`)
+	matchBL := reBL.FindStringSubmatch(bodyString)
+	if len(matchBL) >= 2 {
+		c.VersionBL = matchBL[1]
+	} else {
+		reBL2 := regexp.MustCompile(`data-bl="(.*?)"`)
+		matchBL2 := reBL2.FindStringSubmatch(bodyString)
+		if len(matchBL2) >= 2 {
+			c.VersionBL = matchBL2[1]
+		}
+	}
+
+	// 直接匹配 BL 字串格式
+	if c.VersionBL == "" {
+		reBL3 := regexp.MustCompile(`boq_assistant-bard-web-server_[a-zA-Z0-9._]+`)
+		matchBL3 := reBL3.FindString(bodyString)
+		if matchBL3 != "" {
+			c.VersionBL = matchBL3
+		}
+	}
+
+	if c.VersionBL == "" {
+		snippet := bodyString
+		if len(snippet) > 500 {
+			snippet = snippet[:500]
+		}
+		log.Printf("Warning: Could not extract 'bl' version, using fallback. Response preview: %s", snippet)
+		c.VersionBL = "boq_assistant-bard-web-server_20260218.05_p0"
+	} else {
+		log.Printf("Extracted BL Version: %s", c.VersionBL)
+	}
+
+	reSID := regexp.MustCompile(`"f.sid":"(.*?)"`)
+	matchSID := reSID.FindStringSubmatch(bodyString)
+	if len(matchSID) >= 2 {
+		c.FSID = matchSID[1]
+	}
+
+	return nil
+}
+
+func (c *Client) StreamGenerateContent(prompt string, model string, files []FileData, meta *ChatMetadata) (io.ReadCloser, error) {
+	resp, err := c.doGenerateContentRequest(prompt, model, files, meta)
+	if err != nil {
+		return nil, err
+	}
+
+	traceID := ""
+	if meta != nil {
+		traceID = strings.TrimSpace(meta.TraceID)
+	}
+
+	if resp.StatusCode == http.StatusForbidden {
+		preview := readBodyPreview(resp.Body)
+		resp.Body.Close()
+		log.Printf("[Trace '%s'] 账号 '%s' 请求返回 403，准备重新初始化后重试。响应预览: %s", traceID, c.displayAccountID(), preview)
+
+		if err := c.Init(); err != nil {
+			return nil, err
+		}
+
+		resp, err = c.doGenerateContentRequest(prompt, model, files, meta)
+		if err != nil {
+			return nil, err
+		}
+
+		if resp.StatusCode == http.StatusForbidden {
+			preview = readBodyPreview(resp.Body)
+			resp.Body.Close()
+			log.Printf("[Trace '%s'] 账号 '%s' 重新初始化后仍然返回 403。响应预览: %s", traceID, c.displayAccountID(), preview)
+			return nil, fmt.Errorf("Account authentication failed (403). Cookie may be expired. Please update cookies in .env")
+		}
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		preview := readBodyPreview(resp.Body)
+		statusCode := resp.StatusCode
+		resp.Body.Close()
+		log.Printf("[Trace '%s'] 账号 '%s' 请求失败，状态码 %d，响应预览: %s", traceID, c.displayAccountID(), statusCode, preview)
+		return nil, fmt.Errorf("generate request failed with status: %d", statusCode)
+	}
+
+	// 包装为带空闲超时和退化循环检测的 reader
+	return NewGuardedReader(resp.Body, c.displayAccountID()), nil
+}
+
+func (c *Client) doGenerateContentRequest(prompt string, model string, files []FileData, meta *ChatMetadata) (*http.Response, error) {
+	payload := BuildGeneratePayload(prompt, c.ReqID, files, meta)
+	c.ReqID++
+
+	form := url.Values{}
+	form.Set("f.req", payload)
+	form.Set("at", c.SNlM0e)
+	data := form.Encode()
+
+	req, _ := http.NewRequest(http.MethodPost, EndpointGenerate, strings.NewReader(data))
+
+	q := req.URL.Query()
+	q.Add("bl", c.VersionBL)
+	q.Add("_reqid", fmt.Sprintf("%d", c.ReqID))
+	q.Add("rt", "c")
+	if c.FSID != "" {
+		q.Add("f.sid", c.FSID)
+	}
+	req.URL.RawQuery = q.Encode()
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=utf-8")
+	req.Header.Set("User-Agent", GetCurrentUserAgent())
+	req.Header.Set("Origin", "https://gemini.google.com")
+	req.Header.Set("Referer", "https://gemini.google.com/")
+	req.Header.Set("X-Same-Domain", "1")
+	req.Header.Set("Accept-Language", getLangHeader())
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	if meta != nil && strings.TrimSpace(meta.TraceID) != "" {
+		req.Header.Set("X-Request-Id", strings.TrimSpace(meta.TraceID))
+	}
+
+	if headerVal, ok := ModelHeaders[model]; ok {
+		req.Header.Set("x-goog-ext-525001261-jspb", headerVal)
+	} else {
+		log.Printf("Warning: Unknown model '%s', using default header (gemini-2.5-flash).", model)
+		req.Header.Set("x-goog-ext-525001261-jspb", ModelHeaders["gemini-2.5-flash"])
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+func (c *Client) FetchImage(imageURL string) ([]byte, error) {
+	maxRedirects := 5
+	currentURL := imageURL
+
+	for i := 0; i < maxRedirects; i++ {
+		u, _ := url.Parse(currentURL)
+		var cookieList []*http.Cookie
+		for k, v := range c.Cookies {
+			cookieList = append(cookieList, &http.Cookie{
+				Name:   k,
+				Value:  v,
+				Domain: u.Host,
+				Path:   "/",
+			})
+		}
+		c.httpClient.SetCookies(u, cookieList)
+
+		req, _ := http.NewRequest(http.MethodGet, currentURL, nil)
+		req.Header.Set("User-Agent", GetCurrentUserAgent())
+		req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			location := resp.Header.Get("Location")
+			resp.Body.Close()
+			if location == "" {
+				return nil, fmt.Errorf("redirect with no Location header")
+			}
+			currentURL = location
+			continue
+		}
+
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			return nil, fmt.Errorf("image fetch failed with status: %d", resp.StatusCode)
+		}
+
+		return io.ReadAll(resp.Body)
+	}
+
+	return nil, fmt.Errorf("too many redirects")
+}
+
+func GetLanguage() string {
+	lang := os.Getenv("LANGUAGE")
+	if lang == "" {
+		lang = "en"
+	}
+	return lang
+}
+
+func getLangHeader() string {
+	lang := GetLanguage()
+	return lang + ",en;q=0.9"
+}
+
+func (c *Client) displayAccountID() string {
+	if strings.TrimSpace(c.AccountID) == "" {
+		return "default"
+	}
+	return c.AccountID
+}
+
+func readBodyPreview(body io.ReadCloser) string {
+	if body == nil {
+		return ""
+	}
+
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return fmt.Sprintf("读取响应失败: %v", err)
+	}
+
+	preview := strings.TrimSpace(string(data))
+	runes := []rune(preview)
+	if len(runes) > 500 {
+		preview = string(runes[:500])
+	}
+
+	if preview == "" {
+		return "<empty>"
+	}
+
+	return preview
+}

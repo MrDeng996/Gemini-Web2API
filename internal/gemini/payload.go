@@ -1,0 +1,110 @@
+package gemini
+
+import (
+	"fmt"
+	"math/rand"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/tidwall/sjson"
+)
+
+// globalRand 是包级全局随机数生成器，避免高并发下重复种子导致的 ID 碰撞。
+var (
+	globalRand   = rand.New(rand.NewSource(time.Now().UnixNano()))
+	globalRandMu sync.Mutex
+)
+
+type FileData struct {
+	URL      string
+	FileName string
+}
+
+type ChatMetadata struct {
+	CID     string
+	RID     string
+	RCID    string
+	TraceID string
+}
+
+// BuildGeneratePayload constructs the 'f.req' parameter.
+// Python logic:
+// json.dumps([
+//
+//	None,
+//	json.dumps([
+//	    [prompt, 0, null, image_list, ...],
+//	    None,
+//	    chat_metadata
+//	]),
+//	None,
+//	None
+//
+// ])
+func BuildGeneratePayload(prompt string, reqID int, files []FileData, meta *ChatMetadata) string {
+	imagesJSON := `[]`
+	if len(files) > 0 {
+		for i, f := range files {
+			item := `[]`
+			urlArr := `[]`
+			urlArr, _ = sjson.Set(urlArr, "0", f.URL)
+			urlArr, _ = sjson.Set(urlArr, "1", 1)
+
+			item, _ = sjson.SetRaw(item, "0", urlArr)
+			item, _ = sjson.Set(item, "1", f.FileName)
+
+			imagesJSON, _ = sjson.SetRaw(imagesJSON, fmt.Sprintf("%d", i), item)
+		}
+	}
+
+	msgStruct := `[]`
+	msgStruct, _ = sjson.Set(msgStruct, "0", prompt)
+	msgStruct, _ = sjson.Set(msgStruct, "1", 0)
+	msgStruct, _ = sjson.Set(msgStruct, "2", nil)
+	msgStruct, _ = sjson.SetRaw(msgStruct, "3", imagesJSON)
+	msgStruct, _ = sjson.Set(msgStruct, "4", nil)
+	msgStruct, _ = sjson.Set(msgStruct, "5", nil)
+	msgStruct, _ = sjson.Set(msgStruct, "6", nil)
+
+	inner := `[]`
+	inner, _ = sjson.SetRaw(inner, "0", msgStruct)
+
+	// 語言字段，匹配瀏覽器 f.req 格式
+	langArr := `[]`
+	langArr, _ = sjson.Set(langArr, "0", GetLanguage())
+	inner, _ = sjson.SetRaw(inner, "1", langArr)
+
+	if meta != nil {
+		metaArr := `[]`
+		metaArr, _ = sjson.Set(metaArr, "0", meta.CID)
+		metaArr, _ = sjson.Set(metaArr, "1", meta.RID)
+		metaArr, _ = sjson.Set(metaArr, "2", meta.RCID)
+		inner, _ = sjson.SetRaw(inner, "2", metaArr)
+	} else {
+		inner, _ = sjson.Set(inner, "2", nil)
+	}
+
+	// Pad to index 7
+	for i := 3; i < 7; i++ {
+		inner, _ = sjson.Set(inner, fmt.Sprintf("%d", i), nil)
+	}
+	// Snapshot Streaming disabled by default (causes issues with incremental updates)
+	// Set SNAPSHOT_STREAMING=1 in .env to enable
+	if os.Getenv("SNAPSHOT_STREAMING") == "1" {
+		inner, _ = sjson.Set(inner, "7", 1)
+	}
+
+	outer := `[null, "", null, null]`
+	outer, _ = sjson.Set(outer, "1", inner)
+
+	return outer
+}
+
+// GenerateReqID 生成一个 [100000, 200000) 范围内的随机请求 ID。
+// 使用包级全局 rand 实例 + 互斥锁，保证高并发下不产生重复 ID。
+func GenerateReqID() int {
+	globalRandMu.Lock()
+	defer globalRandMu.Unlock()
+	return globalRand.Intn(100000) + 100000
+}

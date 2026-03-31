@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  gemini-web2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gemini-web2api:latest
+    container_name: gemini-web2api
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8007}:${PORT:-8007}"
+    env_file:
+      - .env
+    environment:
+      - PORT=${PORT:-8007}
+    volumes:
+      # 挂载 .env 文件，支持热重载（修改 .env 后容器自动重新加载账号）
+      - ./.env:/app/.env:rw
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:${PORT:-8007}/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
